@@ -3,37 +3,79 @@ import chainer.functions as F
 import chainer.links as L
 
 from collections import OrderedDict
-from sequential import Sequential
+from .sequential import Sequential
 
 
-class Block(chainer.Chain):
-
-    """A convolution, batch norm, ReLU block.
-
-    A block in a feedforward network that performs a
-    convolution followed by batch normalization followed
-    by a ReLU activation.
-
-    For the convolution operation, a square filter size is used.
-
-    Args:
-        out_channels (int): The number of output channels.
-        ksize (int): The size of the filter is ksize x ksize.
-        pad (int): The padding to use for the convolution.
-
-    """
-
-    def __init__(self, out_channels, ksize, pad=1):
-        super(Block, self).__init__()
-        with self.init_scope():
-            self.conv = L.Convolution2D(None, out_channels, ksize, pad=pad,
-                                        nobias=True)
-            self.bn = L.BatchNormalization(out_channels)
+class GroupedConvolution2D(chainer.ChainList):
+    def __init__(self, in_chs, out_chs, ksize=None, stride=1, pad=0, groups=1, nobias=False, initialW=None, initial_bias=None):
+        assert in_chs % groups == 0
+        assert out_chs % groups == 0
+        group_in_chs = int(in_chs / groups)
+        group_out_chs = int(in_chs / groups)
+        super(GroupedConvolution2D, self).__init__(
+            *[L.Convolution2D(group_in_chs, group_out_chs, ksize, stride, pad, nobias, initialW, initial_bias) for _ in range(groups)]
+        )
+        self.group_in_chs = group_in_chs
 
     def __call__(self, x):
-        h = self.conv(x)
-        h = self.bn(h)
-        return F.relu(h)
+        return F.concat([f(x[:,i*self.group_in_chs:(i+1)*self.group_in_chs,:,:]) for i, f in enumerate(self.children())], axis=1)
+
+
+class DualPathBlock(chainer.Chain):
+    def __init__(self, in_chs, num_1x1_a, num_3x3_b, num_1x1_c, inc, G, _type='normal'):
+        super(DualPathBlock, self).__init__()
+        self.num_1x1_c = num_1x1_c
+
+        if _type is 'proj':
+            key_stride = 1
+            self.has_proj = True
+        if _type is 'down':
+            key_stride = 2
+            self.has_proj = True
+        if _type is 'normal':
+            key_stride = 1
+            self.has_proj = False
+
+        with self.init_scope():
+            if self.has_proj:
+                self.c1x1_w = self.BN_ReLU_Conv(in_chs=in_chs, out_chs=num_1x1_c+2*inc, kernel_size=1, stride=key_stride)
+
+            self.layers = Sequential(OrderedDict([
+                ('c1x1_a', self.BN_ReLU_Conv(in_chs=in_chs, out_chs=num_1x1_a, kernel_size=1, stride=1)),
+                ('c3x3_b', self.BN_ReLU_Conv(in_chs=num_1x1_a, out_chs=num_3x3_b, kernel_size=3, stride=key_stride, padding=1, groups=G)),
+                ('c1x1_c', self.BN_ReLU_Conv(in_chs=num_3x3_b, out_chs=num_1x1_c+inc, kernel_size=1, stride=1)),
+            ]))
+
+    def BN_ReLU_Conv(self, in_chs, out_chs, kernel_size, stride, padding=0, groups=1):
+        if groups==1:
+            return Sequential(OrderedDict([
+                ('norm', L.BatchNormalization(in_chs)),
+                ('relu', F.relu),
+                ('conv', L.Convolution2D(in_chs, out_chs, kernel_size, stride, padding, nobias=True)),
+            ]))
+        else:
+            return Sequential(OrderedDict([
+                ('norm', L.BatchNormalization(in_chs)),
+                ('relu', F.relu),
+                ('conv', GroupedConvolution2D(in_chs, out_chs, kernel_size, stride, padding, groups, nobias=True)),
+            ]))
+            
+
+    def __call__(self, x):
+        data_in = F.concat(x, axis=1) if isinstance(x, list) else x
+        if self.has_proj:
+            data_o = self.c1x1_w(data_in)
+            data_o1 = data_o[:,:self.num_1x1_c,:,:]
+            data_o2 = data_o[:,self.num_1x1_c:,:,:]
+        else:
+            data_o1 = x[0]
+            data_o2 = x[1]
+
+        out = self.layers(data_in)
+
+        summ = data_o1 + out[:,:self.num_1x1_c,:,:]
+        dense = F.concat([data_o2, out[:,self.num_1x1_c:,:,:]], axis=1)
+        return [summ, dense]
 
 
 class MaxPooling2D(object):
@@ -44,8 +86,6 @@ class MaxPooling2D(object):
         return F.max_pooling_2d(x, *self.args)
 
 
-# DPN92 num_init_features=64, k_R=96, G=32, k_sec=(3,4,20,3),
-# inc_sec=(16,32,24,128), num_class=1000
 class DPN92(chainer.Chain):
 
     def __init__(self, class_labels=10):
@@ -65,73 +105,48 @@ class DPN92(chainer.Chain):
         )
 
         bw = 256
-        inc = inc_sec[0]
+        inc = self.inc_sec[0]
         R = int((self.k_R*bw)/256)
-        blocks['conv2_1'] = DualPathBlock(self.num_init_features, R, R, bw, inc, self.G, 'proj')
+        blocks['conv2_1'] = DualPathBlock(self.num_init_features, R, R, bw, inc, self.g, 'proj')
         in_chs = bw + 3 * inc
-        for i in range(2, k_sec[0]+1):
-            blocks['conv2_{}'.format(i)] = DualPathBlock(in_chs, R, R, bw, inc, self.G, 'normal')
+        for i in range(2, self.k_sec[0]+1):
+            blocks['conv2_{}'.format(i)] = DualPathBlock(in_chs, R, R, bw, inc, self.g, 'normal')
             in_chs += inc
 
-        super(DPN92, self).__init__()
+        bw = 512
+        inc = self.inc_sec[1]
+        R = int((self.k_R*bw)/256)
+        blocks['conv3_1'] = DualPathBlock(in_chs, R, R, bw, inc, self.g, 'down')
+        in_chs = bw + 3 * inc
+        for i in range(2, self.k_sec[1]+1):
+            blocks['conv3_{}'.format(i)] = DualPathBlock(in_chs, R, R, bw, inc, self.g, 'normal')
+            in_chs += inc
+
+        bw = 1024
+        inc = self.inc_sec[2]
+        R = int((self.k_R*bw)/256)
+        blocks['conv4_1'] = DualPathBlock(in_chs, R, R, bw, inc, self.g, 'down')
+        in_chs = bw + 3 * inc
+        for i in range(2, self.k_sec[2]+1):
+            blocks['conv4_{}'.format(i)] = DualPathBlock(in_chs, R, R, bw, inc, self.g, 'normal')
+            in_chs += inc
+
+        bw = 2048
+        inc = self.inc_sec[3]
+        R = int((self.k_R*bw)/256)
+        blocks['conv5_1'] = DualPathBlock(in_chs, R, R, bw, inc, self.g, 'down')
+        in_chs = bw + 3 * inc
+        for i in range(2, self.k_sec[3]+1):
+            blocks['conv5_{}'.format(i)] = DualPathBlock(in_chs, R, R, bw, inc, self.g, 'normal')
+            in_chs += inc
+
         with self.init_scope():
-            self.block1_1 = Block(64, 3)
-            self.block1_2 = Block(64, 3)
-            self.block2_1 = Block(128, 3)
-            self.block2_2 = Block(128, 3)
-            self.block3_1 = Block(256, 3)
-            self.block3_2 = Block(256, 3)
-            self.block3_3 = Block(256, 3)
-            self.block4_1 = Block(512, 3)
-            self.block4_2 = Block(512, 3)
-            self.block4_3 = Block(512, 3)
-            self.block5_1 = Block(512, 3)
-            self.block5_2 = Block(512, 3)
-            self.block5_3 = Block(512, 3)
-            self.fc1 = L.Linear(None, 512, nobias=True)
-            self.bn_fc1 = L.BatchNormalization(512)
-            self.fc2 = L.Linear(None, class_labels, nobias=True)
+            self.features = Sequential(blocks)
+            self.classifier = L.Linear(in_chs, class_labels)
+
 
     def __call__(self, x):
-        # 64 channel blocks:
-        h = self.block1_1(x)
-        h = F.dropout(h, ratio=0.3)
-        h = self.block1_2(h)
-        h = F.max_pooling_2d(h, ksize=2, stride=2)
-
-        # 128 channel blocks:
-        h = self.block2_1(h)
-        h = F.dropout(h, ratio=0.4)
-        h = self.block2_2(h)
-        h = F.max_pooling_2d(h, ksize=2, stride=2)
-
-        # 256 channel blocks:
-        h = self.block3_1(h)
-        h = F.dropout(h, ratio=0.4)
-        h = self.block3_2(h)
-        h = F.dropout(h, ratio=0.4)
-        h = self.block3_3(h)
-        h = F.max_pooling_2d(h, ksize=2, stride=2)
-
-        # 512 channel blocks:
-        h = self.block4_1(h)
-        h = F.dropout(h, ratio=0.4)
-        h = self.block4_2(h)
-        h = F.dropout(h, ratio=0.4)
-        h = self.block4_3(h)
-        h = F.max_pooling_2d(h, ksize=2, stride=2)
-
-        # 512 channel blocks:
-        h = self.block5_1(h)
-        h = F.dropout(h, ratio=0.4)
-        h = self.block5_2(h)
-        h = F.dropout(h, ratio=0.4)
-        h = self.block5_3(h)
-        h = F.max_pooling_2d(h, ksize=2, stride=2)
-
-        h = F.dropout(h, ratio=0.5)
-        h = self.fc1(h)
-        h = self.bn_fc1(h)
-        h = F.relu(h)
-        h = F.dropout(h, ratio=0.5)
-        return self.fc2(h)
+        features = F.concat(self.features(x), axis=1)
+        out = F.average_pooling_2d(features, ksize=7)
+        out = self.classifier(out)
+        return out

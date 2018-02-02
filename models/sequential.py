@@ -2,6 +2,8 @@ import chainer
 import chainer.links as L
 import chainer.functions as F
 
+from collections import OrderedDict
+
 
 class Sequential(chainer.Chain):
     """A part of the code has been borrowed from https://github.com/musyoku/chainer-sequential-chain

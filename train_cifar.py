@@ -10,6 +10,7 @@ from chainer.datasets import get_cifar10
 from chainer.datasets import get_cifar100
 
 import models.VGG
+import models.dpn
 
 
 def main():
@@ -48,7 +49,8 @@ def main():
         train, test = get_cifar100()
     else:
         raise RuntimeError('Invalid dataset choice.')
-    model = L.Classifier(models.VGG.VGG(class_labels))
+    #model = L.Classifier(models.VGG.VGG(class_labels))
+    model = L.Classifier(models.dpn.DPN92(class_labels))
     if args.gpu >= 0:
         # Make a specified GPU current
         chainer.cuda.get_device_from_id(args.gpu).use()
