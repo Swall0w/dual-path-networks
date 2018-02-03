@@ -89,6 +89,7 @@ class MaxPooling2D(object):
 class DPN92(chainer.Chain):
 
     def __init__(self, class_labels=10):
+        super(DPN92, self).__init__()
         self.k_R = 96
         self.num_init_features = 64
         self.g = 32
